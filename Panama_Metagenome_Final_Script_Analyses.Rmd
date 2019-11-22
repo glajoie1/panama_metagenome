@@ -1,0 +1,989 @@
+---
+title: "Panama Paper"
+author: "Genevieve Lajoie, Steve Kembel"
+date: "20/09/2019"
+output: html_document
+---
+
+#### Setup
+
+Load required packages (code/output hidden)
+
+```{r packages, message=FALSE, warning=TRUE, include=FALSE}
+pack<-c('ade4','reshape2','vegan','splitstackshape','phytools','plyr','dplyr','candisc','ape','adespatial','entropart','ggplot2','gridExtra','factoextra','FactoMineR','picante','npmv','devtools','RColorBrewer','networkD3','flipPlots','knitr', 'phylobase')
+#lapply(pack, install.packages, dependencies=TRUE)
+#flipPlots is installed from github:
+#install.packages("devtools")
+#library(devtools)
+#install_github("Displayr/flipPlots")
+lapply(pack, require, character.only = TRUE)
+```
+
+Set working directory. 
+
+```{r setup}
+knitr::opts_knit$set(root.dir = '/data/shared/panama_metagenome/code_data')
+```
+
+Load R Workspace.
+
+The workspace contains:
+
+* *metadata* on the samples 
+* site x function relative abundance tables generated from Tax4Fun (*tax4.rel*) and from the metagenomics data (*meta.rel*) based on simple Kegg identifiants
+* the kegg functional hierarchy (*kegg.cat*)
+* site x function relative abundance tables generated for each hierarchical level (K>C>B>A), respectively for Tax4Fun data (*tax.catC*,*tax.catB*,*tax.catA*) and for metagenomics data (*meta.catC*, *meta.catB*, *meta.catA*)
+* *data.funcat* is meta.rel on which functional categories have been appended
+* *tax* holds rarefied relative abundance tables of taxonomic annotations for each of 6 taxonomic levels (phylum, class, order, family, genus, species)
+
+For information on how these datasets were generated, see file 'Panama_Metagenome_Data_Preparation.R' in the working directory.
+
+```{r workspace}
+load('panama.function.workspace.RData')
+ls()
+```
+
+
+#### Metagenomic characterization of phyllosphere microbial functions
+
+##### Summary of functional profiles (across all 24 samples)
+
+```{r, echo=FALSE, fig.width = 10, fig.height=14}
+# Creating melted datafiles
+# A
+meta.catA.m<-melt(meta.catA)
+meta.catA.m$funcat<-'A'
+# B
+meta.catB.m<-melt(meta.catB)
+meta.catB.m$funcat<-'B'
+# C
+meta.catC.m<-melt(meta.catC)
+meta.catC.m$funcat<-'C'
+# Calculating means across samples for each category
+meta.catA.g<-aggregate(value~Var2, meta.catA.m, mean) 
+meta.catA.g$cat<-rep('A',nrow(meta.catA.g))
+meta.catA.g$A<-meta.catA.g$Var2
+meta.catA.g$B<-rep(NA,nrow(meta.catA.g))
+meta.catB.g<-aggregate(value~Var2, meta.catB.m, mean) 
+meta.catB.g$cat<-rep('B',nrow(meta.catB.g))
+meta.catB.g<-merge(meta.catB.g, kegg.cat[,c(1:2)], by.x=c('Var2'), by.y=c('B'), all.x=T, all.y=F)
+meta.catB.g<-meta.catB.g[!duplicated(meta.catB.g),]
+meta.catB.g$B<-meta.catB.g$Var2
+meta.catC.g<-aggregate(value~Var2, meta.catC.m, mean) 
+meta.catC.g$cat<-rep('C',nrow(meta.catC.g))
+meta.catC.g<-merge(meta.catC.g, kegg.cat[,c(1:3)], by.x=c('Var2'), by.y=c('C'), all.x=T, all.y=F)
+meta.catC.g<-meta.catC.g[!duplicated(meta.catC.g),]
+meta.catC.g$value<-meta.catC.g$value/sum(meta.catC.g$value)
+meta.bind<-rbind(meta.catA.g,meta.catB.g,meta.catC.g)
+meta.bind<-meta.bind[order(meta.bind$cat,meta.bind$A,meta.bind$B),]
+meta.bind$Var2<-factor(meta.bind$Var2, levels = unique(meta.bind$Var2))
+meta.bind$A<-factor(meta.bind$A, levels = unique(meta.bind$A))
+meta.bind$Method<-'Meta'
+# Transform data for plotting
+comp.bind<- meta.bind
+comp.bind <- ddply(comp.bind, .(cat, Method),
+                   transform, init = 1- cumsum(value) + (0.5 * value))
+comp.bind <- ddply(comp.bind, .(cat, Method, A),
+                   transform, pos = rev(value))  #1- cumsum(value) + (0.5 * value)
+comp.bind <- ddply(comp.bind, .(cat, Method),
+                   transform, finpos = 1- cumsum(pos) + (0.5 * pos))  #1- cumsum(value) + (0.5 * value)
+comp.bind <- ddply(comp.bind, .(cat, Method, A),
+                   transform, fin = rev(finpos))  #1- cumsum(value) + (0.5 * value)
+# Samples aggregated / within or across treatments 
+# Note that categories are not "cross consistent" because some Keggs might be scored in more than 1 C categories,  which may be lost when aggregating at B and A levels (overinflating the representation of these Keggs)
+ggplot(data=comp.bind, aes(x=Method, y=value, fill=A)) +
+  geom_bar(color='black', stat='identity', group="Var2", position='stack') +
+  geom_text(data=subset(comp.bind, value > 0.02), aes(x=Method, y=fin, label=Var2), size=3) +
+  facet_grid(cat~.)+
+  theme_bw()+
+  theme(legend.position="none")+
+  labs(x='Functional categories', y='Relative abundance')
+```
+
+###### Sankey diagram of function abundances across all samples
+
+```{r, echo=FALSE}
+# Code for Sankey diagram
+
+## Can move the nodes around to make more space.
+## Possibly simply the C output by removing more functions (aggregating the MAPK for example)
+
+# Use rarefied dataset (generated from rareseqfun)
+data.funcat2 <- read.csv("/data/shared/panama_metagenome/code_data/data.funcat.csv", header=T, row.names=1)
+
+# Remove PATH bracket 
+data.funcat2$C<-gsub(' \\[(.)*', '', data.funcat2$C)
+
+data.test<-aggregate(value~A+B+C, data.funcat2, mean) 
+df<-data.test
+df<-data.test[data.test$value>0.0005,]
+ds<-data.test[data.test$value<=0.005,]
+dsa<-aggregate(value~A+B, ds, sum)
+dsa$C<-paste('Diverse',dsa$B,sep='.')
+dsa<-dsa[,c(1,2,4,3)]
+dff<-rbind(dsa,df)
+
+# Remove redundant categories
+dff<-dff[-which(dff$C%in%c('MAPK signaling pathway - fly','MAPK signaling pathway - plant')),]
+
+# Create Sankey object
+gh<-SankeyDiagram(dff[,c(1:3)], max.categories = 90, 
+              link.color = "Source", weights = dff$value,
+             label.show.percentages=T)
+
+# Remove percentages in C names
+lines<-grep('C:', gh$x$nodes$name)
+gh$x$nodes$name<-as.character(gh$x$nodes$name)
+gh$x$nodes$name[lines]<-gsub(' \\((.)*', '', gh$x$nodes$name[lines])
+gh$x$nodes$name<-as.factor(gh$x$nodes$name)
+
+# Creating object for plotting
+aa<-gh$x$links
+bb<-gh$x$nodes
+colnames(aa)[1:2]<-c('IDsource','IDtarget')
+aa<-merge(aa,bb, by='group')
+colnames(aa)[5]<-'source'
+aa<-merge(aa,bb, by.x=c('IDtarget'), by.y=c('group'))
+colnames(aa)[6]<-'target'
+aa<-aa[,-c(2)]
+#bb<-bb[,-c(2), drop=FALSE]
+
+rm.group<-grep('C: Diverse', aa$target)
+aa.sub<-aa[-rm.group,-c(1:2)]
+
+# Create new nodes
+nodes <- data.frame(name=c(as.character(aa.sub$source), as.character(aa.sub$target)) %>% unique())
+#nodes$group=nodes$name
+
+# Add ids to aa dataset
+aa.sub$IDsource<-match(aa.sub$source, nodes$name)-1 
+aa.sub$IDtarget<-match(aa.sub$target, nodes$name)-1
+aa.sub<-aa.sub[order(aa.sub$IDsource,aa.sub$IDtarget),]
+
+
+# Create color palette
+ncolor<-length(unique(aa.sub$IDsource))
+colors <- data.frame(cbind(colorRampPalette(brewer.pal(8, "Set1"))(ncolor), unique(aa.sub$IDsource)))
+aa.sub$color<-colors[match(aa.sub$IDsource, colors$X2),1]
+
+# Add colors to nodes
+nodes$color<-aa.sub[match(nodes$name, aa.sub$target),6]
+nodes$color[1:5]<-aa.sub[match(nodes$name[1:5], aa.sub$source),6]
+
+# Plot
+sankeyNetwork(Links=aa.sub, Nodes=nodes, Source='IDsource', Target='IDtarget', Value='value', NodeID="name", LinkGroup="color", NodeGroup='color', nodePadding=7, fontSize=11, sinksRight=FALSE)
+
+```
+
+
+
+#### Variation in phyllosphere functions among versus within samples
+
+Compare components of diversity among categorical levels using *DivPart* function from {entropart}.
+
+##### Diversity partitioning - For all samples
+
+```{r, echo=FALSE}
+# Cat K
+meta.MCK<-MetaCommunity(t(meta.rel), Weights = rep(1, ncol(t(meta.rel))))
+meta.divK<-DivPart(MC=meta.MCK)
+# Cat C
+meta.MCC<-MetaCommunity(t(meta.catC), Weights = rep(1, ncol(t(meta.catC))))
+meta.divC<-DivPart(MC=meta.MCC) # Ignore error message, sample coverages are OK.
+# Cat B
+meta.MCB<-MetaCommunity(t(meta.catB), Weights = rep(1, ncol(t(meta.catB))))
+meta.divB<-DivPart(MC=meta.MCB)
+```
+
+```{r, echo=FALSE}
+# Multi object
+div<-as.data.frame(rbind(meta.divK, meta.divC, meta.divB))
+ss<-matrix(unlist(div$CommunityAlphaDiversities),3,24, byrow=T)
+colnames(ss)<-paste("CommunityAlphaDiversities",rownames(tax4.rel), sep=".")
+tt<-matrix(unlist(div$CommunityAlphaEntropies),3,24, byrow=T)
+colnames(tt)<-paste("CommunityAlphaEntropies",rownames(tax4.rel), sep=".")
+div<-as.data.frame(cbind(div,ss,tt))
+div<-div[,-which(colnames(div)%in%c('CommunityAlphaEntropies','CommunityAlphaDiversities'))]
+divsub<-as.data.frame(round(apply(div[,6:11],2,unlist),digits=4))
+rownames(divsub)<-rownames(div)
+# Calculating percentages
+divsub$Prop.Alpha<-round(divsub$TotalAlphaEntropy/divsub$GammaEntropy*100, digits=1)
+divsub$Prop.Beta<-round(divsub$TotalBetaEntropy/divsub$GammaEntropy*100, digits=1)
+divsub
+```
+
+
+
+#### Influence of species replicates on diversity partitioning
+
+For running the code on the set of 24 samples, use datasets above. For running the code on one sample per plant species (removing duplicates), perform the following and use these data (may want to re-run multiple times with random subsets, currently uses the first sample for each species):
+
+```{r}
+# Remove 65_S10 sample because it is an outlier in Tax4 dataset
+# metadata.sub<-metadata[(rownames(metadata)!='65_S10'),]
+metadata.sub<-metadata
+# How many duplicated species?
+table(duplicated(metadata.sub$Species)) # 7
+# How many combinations of duplicated species?
+2^7 # 128
+# Species with no duplication
+nodup<-names(which(table(metadata.sub$Species)==1))
+rownodup<-which(metadata$Species%in%nodup)
+# Species with duplication
+dup<-names(which(table(metadata.sub$Species)==2))
+
+rowdup<-NULL
+# Rows of duplicated species
+for (i in 1:length(dup)){
+  rn<-which(metadata.sub$Species==dup[i])
+  rowdup<-rbind(rowdup,rn)
+}
+rownames(rowdup)<-dup
+rowdup.t<-t(rowdup)
+
+# All combinations of duplicated species
+d1 <- expand.grid(rowdup.t[,1],rowdup.t[,2],rowdup.t[,3],rowdup.t[,4],rowdup.t[,5],rowdup.t[,6],rowdup.t[,7])
+
+# TODO update with tax.x objects if needed?
+#tax.catC.sub<-rest(tax.catC)
+#tax.catB.sub<-rest(tax.catB)
+#tax.catA.sub<-rest(tax.catA)
+# TODO - do we need to do this for the combined meta.tax list object?
+#meta.tax.sub<-rest(meta.tax)
+```
+
+Most variation in the dataset is actually alpha diversity, with a small overall contribution of beta diversity.
+
+##### Diversity partitioning - Testing the impact of using only one sample per host species
+
+```{r, echo=FALSE}
+divtot<-NULL
+for (i in 1:nrow(d1)){
+
+# Generate new dataset based on these combinations
+row.i<-sort(unlist(c(rownodup,d1[i,])))
+meta.rel.sub<-meta.rel[row.i,]
+meta.catC.sub<-meta.catC[row.i,]
+meta.catB.sub<-meta.catB[row.i,]
+meta.catA.sub<-meta.catA[row.i,]
+  
+# Cat K
+meta.MCK<-MetaCommunity(t(meta.rel.sub), Weights = rep(1, ncol(t(meta.rel.sub))))
+meta.divK<-DivPart(MC=meta.MCK)
+# Cat C
+meta.MCC<-MetaCommunity(t(meta.catC.sub), Weights = rep(1, ncol(t(meta.catC.sub))))
+meta.divC<-DivPart(MC=meta.MCC) # Ignore error message, sample coverages are OK.
+# Cat B
+meta.MCB<-MetaCommunity(t(meta.catB.sub), Weights = rep(1, ncol(t(meta.catB.sub))))
+meta.divB<-DivPart(MC=meta.MCB)
+
+# Multi object
+div<-as.data.frame(rbind(meta.divK, meta.divC, meta.divB))
+ss<-matrix(unlist(div$CommunityAlphaDiversities),3,17, byrow=T)
+colnames(ss)<-paste("CommunityAlphaDiversities",rownames(meta.rel.sub), sep=".")
+tt<-matrix(unlist(div$CommunityAlphaEntropies),3,17, byrow=T)
+colnames(tt)<-paste("CommunityAlphaEntropies",rownames(meta.rel.sub), sep=".")
+div<-as.data.frame(cbind(div,ss,tt))
+div<-div[,-which(colnames(div)%in%c('CommunityAlphaEntropies','CommunityAlphaDiversities'))]
+divsub<-as.data.frame(round(apply(div[,6:11],2,unlist),digits=4))
+rownames(divsub)<-rownames(div)
+# Calculating percentages
+divsub$Prop.Alpha<-round(divsub$TotalAlphaEntropy/divsub$GammaEntropy*100, digits=1)
+divsub$Prop.Beta<-round(divsub$TotalBetaEntropy/divsub$GammaEntropy*100, digits=1)
+divsub$rep<-i
+divtot<-rbind(divtot,divsub)
+}
+
+par(mfrow=c(3,3))
+
+# Compare the values observed for 24 samples vs all combinations of non-duplicated 
+# Functional gene-level
+divtotK<-divtot[seq(1,nrow(divtot),3),]
+hist(divtotK[,4],xlab="Alpha diversity", main='') # Alpha div (entropy)
+abline(v=divsub[1,4], col='red')
+
+hist(divtotK[,5],xlab="Beta diversity", main='') # Beta div (entropy)
+abline(v=divsub[1,5], col='red')
+
+hist(divtotK[,6], xlab="Gamma diversity", main='') # Gamma div (entropy)
+abline(v=divsub[1,6], col='red')
+
+# hist(divtotK[,7]) # All equal in proportions
+# abline(v=divsub[1,7], col='red')
+
+# Tier 3 level
+divtotC<-divtot[seq(2,nrow(divtot),3),]
+hist(divtotC[,4],xlab="Alpha diversity", main='')
+abline(v=divsub[2,4], col='red')
+
+hist(divtotC[,5],xlab="Beta diversity", main='')
+abline(v=divsub[2,5], col='red')
+
+hist(divtotC[,6],xlab="Gamma diversity", main='') 
+abline(v=divsub[2,6], col='red')
+
+#plot(divtotC[,7]) # All equal in propotions
+
+# Tier 2 level
+divtotB<-divtot[seq(3,nrow(divtot),3),]
+hist(divtotB[,4],xlab="Alpha diversity", main='') 
+abline(v=divsub[3,4], col='red')
+
+hist(divtotB[,5],xlab="Beta diversity", main='') 
+abline(v=divsub[3,5], col='red')
+
+hist(divtotB[,6],xlab="Gamma diversity", main='') 
+abline(v=divsub[3,6], col='red')
+
+#plot(divtotB[,7]) # All equal in propotions
+
+```
+
+Duplicates of the same species do not seem to affect the results.
+
+#### **Associations between microbial and plant traits**
+
+```{r}
+# Matrix of plant traits
+trt.ord<-metadata[order(rownames(metadata)),c(9:ncol(metadata))]
+trt.ord<-decostand(trt.ord, method='standardize', na.rm=T)
+trt.ord<-trt.ord[rownames(meta.rel),]
+```
+
+Pairs of highly correlated axes (>0.90 correlation): height/DBH, RGR_10/RGRAVGSAP, MRT_10/MRTALLSAP
+Remove one of the variables in each pair + column with missing data (SG60C_AVG)
+
+```{r}
+trt.ord<-trt.ord[,-c(2,3,9,11)]
+# Remove extensions from trait names
+colnames(trt.ord)<-gsub('_(.)*', '', colnames(trt.ord))
+```
+
+##### Preparing microbial data of interest
+
+```{r, warning=FALSE}
+x<-meta.catC
+# Transforming data
+x.held<-decostand(x, method='hellinger')
+# Some functions seem to be perfectly correlated: explore this
+cor.pca<-cor(x.held[,c(1:ncol(x))])
+# Variables at least once perfectly correlated with another variable
+cornames<-names(which(rowSums(cor.pca == 1) > 1))
+corsub<-cor.pca[which(rowSums(cor.pca == 1) > 1),which(rowSums(cor.pca == 1) > 1)]
+
+# Selecting variables
+x.held<-x.held[,-which(colnames(x.held)%in%cornames[-c(1,2,3,4,6,9,10)])]
+# Appending plant trait data
+x.hel<-cbind(x.held, trt.ord*0.01)
+# Remove brackets
+colnames(x.hel)<-gsub(' \\[(.)*', '', colnames(x.hel))
+```
+
+##### Unconstrained ordination: PCA
+
+```{r}
+# PCA using package {FactoMineR}
+x.pca<-PCA(x.hel, scale.unit=F, quanti.sup=c((ncol(x.held)+1):ncol(x.hel)), graph=F) # ,graph=T
+# Plotting 
+fviz_pca_biplot(x.pca, select.var=list(contrib = 10), cex=0.8, unselect=0.9, label='var', col.quanti.sup='blue') # invisible='quanti.sup', choix=c('ind','var'),
+plot(x.pca, choix='var', select=c('contrib 15', 'quanti.sup'), label=c('var','quanti.sup'), cex=0.6, unselect=0.95, cex.axis=0.9, cex.lab=0.9) # Can select a number of variables most contributing to the PCA (here 20) 
+# Explore results
+fviz_contrib(x.pca, choice = "var", axes = 1:2, top=40) +# 'top' lets you choose how many variables to represent
+theme(axis.text.x = element_text(angle=90))
+# See contributions of each axis to the variance
+fviz_screeplot(x.pca) 
+# Pick most important functions
+dd<-fviz_contrib(x.pca, choice = "var", axes = 1:2)$data # With regard to first two axes, can also be done for separate axes
+# hist(dd$contrib)
+dd2<-dd[dd$contrib>0.90,] # Arbitrary, to keep ~25 functions
+# Which categories are they associated with
+dd2merge<-merge(dd2,kegg.cat[,c(1:3)], by.x=c('name'),by.y=c('C'), all.x=T)
+dd2merge<-dd2merge[!duplicated(dd2merge),]
+dd2merge<-dd2merge[order(dd2merge$A,dd2merge$B,dd2merge$name),]
+dd2merge
+	
+```
+
+#### Evaluating the impact of duplicates in evaluating these contributions
+
+```{r}
+row.i<-sort(unlist(c(rownodup,d1[50,])))
+meta.catC.sub<-meta.catC[row.i,]
+
+x<-meta.catC.sub
+# Transforming data
+x.held.sub<-decostand(x, method='hellinger')
+
+# Appending plant trait data
+x.held.sub<-x.held.sub[,which(colnames(x.held.sub)%in%colnames(x.held))]
+trt.ord.sub<-trt.ord[row.i,]
+x.hel<-cbind(x.held.sub, trt.ord.sub*0.01)
+
+x.pca<-PCA(x.hel, scale.unit=F, quanti.sup=c((ncol(x.held)+1):ncol(x.hel)), graph=F) # ,graph=T
+# Plotting 
+fviz_pca_biplot(x.pca, select.var=list(contrib = 10), cex=0.8, unselect=0.9, label='var', col.quanti.sup='blue') # invisible='quanti.sup', choix=c('ind','var'),
+plot(x.pca, choix='var', select=c('contrib 15', 'quanti.sup'), label=c('var','quanti.sup'), cex=0.6, unselect=0.95, cex.axis=0.9, cex.lab=0.9) # 
+
+```
+
+Very similar visually, how should we present this...
+
+#### Phylogenetic signal of plant and microbial traits
+
+```{r}
+# Code from "phylogeny-analysis.R" (added 18/11/2019)
+#### Starts from workspace containing panama.function.workspace.RData (generated by code in panama.data.R)
+## output of this script saved in workspace panama.phylogeny.workspace.RData
+
+# import tree phylogeny
+# Phylomatic Zanne tree
+# generated using Zanne et al phylogeny on online phylomatic site v3 2018-05
+# branch lengths are dates
+tree.phylo.z <- read.tree("tree-species-zanne-phylomatic.newick.txt")
+
+# get rid of outlier sample from functional analyses
+meta.rel.sub <- meta.rel[-which(rownames(meta.rel)%in%c('65_S10')),]
+metadata.sub <- metadata[rownames(meta.rel.sub),]
+# take a single representative per host species and make new data frames
+meta.rel.spp <- meta.rel.sub[!duplicated(metadata.sub$Species),]
+metadata.spp <- metadata.sub[rownames(meta.rel.spp),]
+rownames(meta.rel.spp) <- rownames(metadata.spp) <- metadata.spp$Species
+
+# sort other data to phylogeny tip label order
+meta.rel.spp <- meta.rel.spp[tree.phylo.z$tip.label,]
+meta.rel.spp <- meta.rel.spp[,apply(meta.rel.spp,2,sum)>0]
+metadata.spp <- metadata.spp[tree.phylo.z$tip.label,]
+
+# subset and sort COG categories as well
+meta.catA.spp <- meta.catA[metadata.spp$sequencing.samplename,]
+meta.catA.spp <- meta.catA.spp[,apply(meta.catA.spp,2,sum)>0]
+meta.catB.spp <- meta.catB[metadata.spp$sequencing.samplename,]
+meta.catB.spp <- meta.catB.spp[,apply(meta.catB.spp,2,sum)>0]
+meta.catC.spp <- meta.catC[metadata.spp$sequencing.samplename,]
+meta.catC.spp <- meta.catC.spp[,apply(meta.catC.spp,2,sum)>0]
+rownames(meta.catA.spp) <- rownames(meta.catB.spp) <- rownames(meta.catC.spp) <- rownames(metadata.spp)
+
+##################################################
+### phylogenetic signal
+
+# check for phylogenetic signal in metagenomic function 'traits'
+meta.rel.spp.signal <- multiPhylosignal(meta.rel.spp, tree.phylo.z, reps=999, checkdata=FALSE)
+meta.catA.spp.signal <- multiPhylosignal(meta.catA.spp, tree.phylo.z, reps=999, checkdata=FALSE)
+meta.catB.spp.signal <- multiPhylosignal(meta.catB.spp, tree.phylo.z, reps=999, checkdata=FALSE)
+meta.catC.spp.signal <- multiPhylosignal(meta.catC.spp, tree.phylo.z, reps=999, checkdata=FALSE)
+
+# which are significantly more signal than expected (being liberal with P-value)
+colnames(meta.rel.spp)[which(meta.rel.spp.signal$PIC.variance.P < 0.05)]
+colnames(meta.catA.spp)[which(meta.catA.spp.signal$PIC.variance.P < 0.05)]
+colnames(meta.catB.spp)[which(meta.catB.spp.signal$PIC.variance.P < 0.05)]
+colnames(meta.catC.spp)[which(meta.catC.spp.signal$PIC.variance.P < 0.05)]
+
+## plot significant signal traits using phylobase
+phy4d <- phylo4d(tree.phylo.z, meta.rel.spp)
+plot(phy4d)
+plot(phy4d[,which(meta.rel.spp.signal$PIC.variance.P<0.05)], grid=FALSE)
+
+phy4d <- phylo4d(tree.phylo.z, meta.catA.spp)
+plot(phy4d)
+plot(phy4d[,which(meta.catA.spp.signal$PIC.variance.P<0.05)], grid=FALSE)
+
+phy4d <- phylo4d(tree.phylo.z, meta.catB.spp)
+plot(phy4d)
+plot(phy4d[,which(meta.catB.spp.signal$PIC.variance.P<0.05)], grid=FALSE)
+
+phy4d <- phylo4d(tree.phylo.z, meta.catC.spp)
+plot(phy4d)
+plot(phy4d[,which(meta.catC.spp.signal$PIC.variance.P<0.05)], grid=FALSE)
+
+# for publication - plot catC high signal traits with cleaned function names
+meta.catC.spp.clean <- meta.catC.spp
+colnames(meta.catC.spp.clean) <- sapply( strsplit(colnames(meta.catC.spp),"\\["), "[", 1)
+phy4d <- phylo4d(tree.phylo.z, meta.catC.spp.clean)
+plot(phy4d[,which(meta.catC.spp.signal$PIC.variance.P<0.05)], square=TRUE, grid=FALSE)
+
+
+```
+
+
+Plot significant signal traits using ggtree [SK: To keep?]
+
+```{r}
+library(ggplot2)
+library(ggtree)
+
+# read Zanne tree
+tree.z <- read.newick("tree-species-zanne-phylomatic.newick.txt")
+
+# plot catC high signal traits with clean function names
+meta.catC.spp.clean <- meta.catC.spp
+colnames(meta.catC.spp.clean) <- sapply( strsplit(colnames(meta.catC.spp),"\\["), "[", 1)
+meta.catC.spp.clean.signif <- meta.catC.spp.clean[,which(meta.catC.spp.signal$PIC.variance.P<0.05)]
+meta.catC.spp.clean.signif <- cbind(rownames(meta.catC.spp.clean.signif), meta.catC.spp.clean.signif)
+meta.catC.spp.clean.signif.scale <- scale(meta.catC.spp.clean.signif,center=FALSE,scale=apply(meta.catC.spp.clean.signif,2,max))
+
+# plot heatmap of trait values for significant traits
+library(grid)
+p <- ggtree(tree.z) + geom_tiplab()
+gheatmap(p, meta.catC.spp.clean.signif.scale, offset=200, colnames_angle=-45, hjust=0, low="white", high="blue", colnames_position="bottom", font.size=2.5, color="gray") + theme(plot.background = element_rect(fill = "transparent", color = NA))
++ theme(plot.margin = unit(c(0,0,1,0), "null"))
+
+p <- ggtree(tree.z) + coord_flip()
+gheatmap(p, meta.catC.spp.clean.signif.scale, low="white", high="blue", color="gray")
+
+```
+
+
+##### Phylogenetically informed analyses of microbial trait correlations
+
+SK: TODO Currently not run - update or delete
+
+```{r, eval=FALSE, include=FALSE}
+##################################################
+##### analyze trait correlations
+# trait ordination to reduce dimensionality
+traits.spp <- metadata.spp[,c(9:29)]
+# replace NA trait values to allow PCA
+for(i in 1:ncol(traits.spp)){
+  traits.spp[is.na(traits.spp[,i]), i] <- mean(traits.spp[,i], na.rm = TRUE)
+}
+
+#################
+# trait signal
+traits.spp.signal <- multiPhylosignal(traits.spp, tree.phylo.z, reps=499, checkdata=FALSE)
+
+## phylobase style
+library(phylobase)
+phy4d <- phylo4d(tree.phylo.z, traits.spp)
+plot(phy4d, grid=FALSE)
+plot(phy4d[,which(traits.spp.signal$PIC.variance.P<0.05)], grid=FALSE)
+
+
+#################
+# trait PCA
+traits.spp.pca <- prcomp(traits.spp, scale=TRUE)
+# axis 1 - leaf economics, axis 2 - mortality/rgr/wood density, axis 3 - height at maturity)
+biplot(traits.spp.pca, col=c("white","black"), xlab="Trait PCA Axis 1", ylab="Trait PCA Axis 2", choices=c(1,2))
+biplot(traits.spp.pca, col=c("white","black"), xlab="Trait PCA Axis 2", ylab="Trait PCA Axis 3", choices=c(1,3))
+
+# procrustes? not signif
+plot(protest(decostand(meta.catB.spp, method="hell"), decostand(traits.spp, method="hell")))
+
+# ordinations with trait overlay
+meta.rel.spp.mds <- metaMDS(decostand(meta.rel.spp, method="hellinger"),k=3)
+ordiplot(meta.rel.spp.mds, display="sites", type="text")
+plot(envfit(meta.rel.spp.mds, traits.spp), p.max=0.05)
+
+# phylogenetic ordination of microbial traits
+meta.rel.spp.pca <- prcomp(decostand(meta.catB.spp, method="hellinger"), scale=TRUE)
+meta.rel.spp.pca.phyl <- phyl.pca(tree.phylo.z, decostand(meta.catB.spp, method="hellinger"), mode="corr")
+par(mfrow=c(1,2))
+biplot(meta.rel.spp.pca)
+envfit(meta.rel.spp.pca, log10(traits.spp))
+plot(envfit(meta.rel.spp.pca, log10(traits.spp)), p.max=0.2)
+biplot(meta.rel.spp.pca.phyl, ylabs=rep("", ncol(meta.catB.spp)), var.axes=FALSE)
+biplot(meta.rel.spp.pca.phyl, xlabs=rep("", nrow(meta.catB.spp)), xlim=c(-30,30), xlab="PC1 (72% of variance)", ylab="PC2 (9% of variance)")
+envfit(meta.rel.spp.pca.phyl$S, log10(traits.spp))
+plot(envfit(meta.rel.spp.pca.phyl$S, log10(traits.spp)), p.max=0.3)
+
+par(mfrow=c(1,1))
+ordiplot(meta.rel.spp.pca.phyl$S, display="sites", type="text")
+ordiellipse(meta.rel.spp.pca.phyl$S, metadata.spp$Order)
+```
+
+
+#### Host filtering of microbial functions
+
+```{r}
+# The principle is to compare the occurrence of traits in observed communities
+# to those obtained from randomizations of community trait matrices, generated by picking traits at random
+# and keeping site totals and trait totals constant.
+# Trait matrix
+m<-round((meta.catC)*10^5) # Can also select specific traits [,1:20]
+# Permutations of the trait matrix to generate "random" communities
+nperm<-999
+x4<-permatfull(m, fixedmar = "both", times=nperm)
+ft.left<-matrix(NA, nrow(m), ncol(m))      # Generate a matrix that will hold the proportions of randomized trait values lower than the observed for each site
+ft.right<-matrix(NA, nrow(m), ncol(m))     # Generate a matrix that will hold the proportions of randomized trait values higher than the observed for each site
+colnames(ft.left)<-colnames(ft.right)<-colnames(m)
+rownames(ft.left)<-rownames(ft.right)<-rownames(m)
+for (k in 1:nrow(m)){                  # For each site
+  
+  gt<-matrix(NA, nperm, ncol(m))         # Generate a matrix that will hold the "i" random values generated for every "k" trait
+  
+  for (i in 1:nperm){
+    for (j in 1:ncol(m)){
+      gt[i,j]<-x4[[3]][[i]][[k,j]]     # Assign the value that corresponds to the right site x trait x permutation combination in object x4
+    }
+  }
+  
+  # Compare the observed value to the null distribution (each column of gt)
+  
+  for (j in 1:ncol(m)){
+    ft.left[k,j]<-length(which(gt[,j]<=m[k,j]))/1000     # Compare observed value to vectors of randomized value for each trait x site combination
+    ft.right[k,j]<-length(which(gt[,j]>=m[k,j]))/1000
+  }
+  
+}
+#hist(ft.left[,4], breaks=20)
+hist(ft.left, breaks=20)
+
+# All together
+  hi<-length(ft.left[ft.left>0.95]) # 1553
+  lo<-length(ft.left[ft.left<0.05]) # 1570
+  tot<-nrow(ft.left)*ncol(ft.left) # 6192
+  
+# Aggregate by B cats
+ft.t<-as.data.frame.matrix(t(ft.left))
+ft.t$C<-rownames(ft.t)
+bb<-kegg.cat[,c(1:3)]
+ft.tm<-merge(ft.t,bb[!duplicated(bb),], by.x='C', by.y='C', all.x=T)
+ft.tm<-ft.tm[!duplicated(ft.tm$C),]
+
+prop.ft<-NULL
+for (i in unique(ft.tm$B)){
+  sub.tm<-ft.tm[which(ft.tm$B==i),-which(colnames(ft.tm)%in%c('C','A','B'))]
+  hi<-length(sub.tm[sub.tm>0.95])
+  lo<-length(sub.tm[sub.tm<0.05])
+  tot<-nrow(sub.tm)*ncol(sub.tm)
+  prop.ft<-rbind(prop.ft, c(hi,lo,tot,i))
+}
+prop.ft<-as.data.frame(prop.ft)
+
+prop.ft[,c(1:3)]<-apply(prop.ft[,c(1:3)],2,FUN=function(x) as.numeric(as.character(x)))
+
+# Turning into percentages
+prop.ft[,5]<-prop.ft[,1]/prop.ft[,3]
+prop.ft[,6]<-prop.ft[,2]/prop.ft[,3]
+colnames(prop.ft)<-c('num.higher','num.lower','num.total','B','prop.higher','prop.lower')
+
+# Add A cats
+bb<-kegg.cat[,c(1:2)]
+prop.m<-merge(prop.ft, bb[!duplicated(bb),], by='B', all.x=T)
+prop.m<-prop.m[order(prop.m$A,prop.m$B),]
+prop.m.fun<-prop.m[,c(7,1,2,5,3,6,4)]
+prop.m.fun[,c(4,6)]<-apply(prop.m.fun[c(4,6)],2,FUN=function(x) round(x*100))
+write.csv(prop.m.fun, '/home/genevieve/propmfun.csv')
+```
+
+
+#### Comparison of functional annotations based on metagenomic versus 16S sequencing
+
+##### Basic statistics
+```{r}
+# Comparing functional identifiants reported (**Could remove 65S_10)
+length(setdiff(colnames(meta.rel),colnames(tax4.rel))) # in meta but not in tax4
+length(setdiff(colnames(tax4.rel), colnames(meta.rel))) # in tax4 but not in meta
+length(intersect(colnames(tax4.rel), colnames(meta.rel))) # in both
+# Proportion of sequences that are part of the shared keggs
+# In meta
+sum(meta.rel[,which(colnames(meta.rel)%in%intersect(colnames(tax4.rel), colnames(meta.rel)))])/sum(meta.rel)
+# In tax4
+sum(tax4.rel[,which(colnames(tax4.rel)%in%intersect(colnames(tax4.rel), colnames(meta.rel)))])/sum(tax4.rel) 
+```
+
+##### Comparing relative abundance of individual functions across datasets.
+
+Relative abundance data was log transformed. The solid red line represents a 1:1 curve, and dotted lines represent B1 5 %.
+
+```{r, echo=FALSE}
+# Defining datasets
+meta.kegg<-meta.rel
+tax4.kegg<-tax4.rel
+funset<-list(meta.kegg,tax4.kegg, meta.catC, tax4.catC, meta.catB, tax4.catB)
+names<-c('Relative abundance of functional genes \n[Metagenomic annotation]','Relative abundance of functional genes \n[Functional prediction]','Relative abundance of Tier 3 functional categories \n[Metagenomic annotation]','Relative abundance of Tier 3 functional categories \n[Functional prediction]','Relative abundance of Tier 2 functional categories \n[Metagenomic annotation]','Relative abundance of Tier 2 functional categories \n[Functional prediction]')
+par(mfrow=c(1,1), mar = c(5, 5, 2, 2))
+is.odd <- function(x) x %% 2 != 0
+mod.res<-list()
+for (i in 1:length(funset)){ # 
+  if (is.odd(i)){
+    meta.cat<-funset[[i]]
+    tax4.cat<-funset[[i+1]]
+    # Melt data tables
+    reltax4.s<-melt(as.matrix(tax4.cat), id.vars=c("col.names","row.names"))
+    relmeta.s<-melt(as.matrix(meta.cat), id.vars=c("col.names","row.names"))
+    relmerge<-merge(relmeta.s,reltax4.s, by=c('Var1','Var2')) # value.x is meta, value.y is tax4
+    # Log transform
+    relmerge2<-relmerge
+    relmerge2$value.x<-log(relmerge2$value.x*10^5+1)
+    relmerge2$value.y<-log(relmerge2$value.y*10^5+1)
+    # Calculate mean for each function
+    mean.x<-aggregate(cbind(value.x,value.y)~Var2, data=relmerge2, FUN=mean)
+    colnames(mean.x)[2:3]<-c('mean.x','mean.y')
+    std.x<-aggregate(cbind(value.x,value.y)~Var2, data=relmerge2, FUN=sd)
+    colnames(std.x)[2:3]<-c('std.x','std.y')
+    meanvar.x<-merge(mean.x,std.x, by=c('Var2'))
+    # Model
+    rel.mod<-lm(relmerge2$value.y~relmerge2$value.x)
+    plot(relmerge2$value.y~relmerge2$value.x, xlab=names[i],ylab=names[i+1]) 
+    abline(a=0,b=1, col='red') # Points under the line indicate functions more abundant in metagenom. and points     above line indicate functions more abundant in 16S
+   # abline(a=0,b=1.05, lty=2, col='red') # 1:1 line +5% or +25%
+  #  abline(a=0, b=0.95, lty=2, col='red') # 1:1 line -5% or -25%
+    ff<-round(summary(lm(relmerge2$value.y~relmerge2$value.x))$adj.r.squared, digits=2)
+    text(2,6.5, bquote(Adj.R^2 == .(ff)))
+  }
+}
+```
+
+#### Generate regressions per B cat
+```{r}
+meta.cat<-funset[[3]]
+tax4.cat<-funset[[4]]
+
+ # Melt data tables
+reltax4.s<-melt(as.matrix(tax4.cat), id.vars=c("col.names","row.names"))
+relmeta.s<-melt(as.matrix(meta.cat), id.vars=c("col.names","row.names"))
+relmerge<-merge(relmeta.s,reltax4.s, by=c('Var1','Var2')) # value.x is meta, value.y is tax4
+# Log transform
+relmerge2<-relmerge
+relmerge2$value.x<-log(relmerge2$value.x*10^5+1)
+relmerge2$value.y<-log(relmerge2$value.y*10^5+1)
+
+# Bind cats
+bb<-kegg.cat[,c(1:3)]
+bb<-bb[!duplicated(bb),]
+
+relmerge3<-merge(relmerge,bb, by.x=c('Var2'),by.y=c('C'),all.x=T)
+
+r2.pic<-NULL
+
+mod.A1<-list()
+# Plots
+relmerge4<-relmerge3[which(relmerge3$A==unique(relmerge3$A)[1]),]
+par(mfrow=c(4,3), mar=c(5,5,5,2))
+for (i in 1:length(unique(relmerge4$B))){
+rm<-relmerge4[which(relmerge4$B==unique(relmerge4$B)[i]),]
+rel.mod<-lm(rm$value.y~rm$value.x)
+mod.A1[[i]]<-summary(rel.mod)
+names(mod.A1)[i]<-unique(relmerge4$B)[i]
+r2.pic<-rbind(r2.pic,c(unique(relmerge4$B)[i],summary(rel.mod)$r.squared,summary(rel.mod)$coefficients[2,4]))
+plot(rm$value.y~rm$value.x, xlab='Relative abundance of Tier 3 functions \n[Metagenomic annotation]',ylab='Relative abundance of Tier 3 functions \n[16S Functional prediction]', main=unique(relmerge4$B)[i]) 
+abline(a=0,b=1, col='red') 
+}   
+
+
+mod.A2<-list()
+relmerge4<-relmerge3[which(relmerge3$A==unique(relmerge3$A)[2]),]
+par(mfrow=c(4,3),mar=c(5,5,5,2))
+for (i in 1:length(unique(relmerge4$B))){
+rm<-relmerge4[which(relmerge4$B==unique(relmerge4$B)[i]),]
+rel.mod<-lm(rm$value.y~rm$value.x)
+mod.A2[[i]]<-summary(rel.mod)
+names(mod.A2)[i]<-unique(relmerge4$B)[i]
+r2.pic<-rbind(r2.pic,c(unique(relmerge4$B)[i],summary(rel.mod)$r.squared,summary(rel.mod)$coefficients[2,4]))
+plot(rm$value.y~rm$value.x, xlab='Relative abundance of Tier 3 functions \n[Metagenomic annotation]',ylab='Relative abundance of Tier 3 functions \n[16S Functional prediction]', main=unique(relmerge4$B)[i]) 
+abline(a=0,b=1, col='red') 
+}    
+
+mod.A3<-list()
+relmerge4<-relmerge3[which(relmerge3$A==unique(relmerge3$A)[3]),]
+par(mfrow=c(4,3),mar=c(5,5,5,2))
+for (i in 1:length(unique(relmerge4$B))){
+rm<-relmerge4[which(relmerge4$B==unique(relmerge4$B)[i]),]
+rel.mod<-lm(rm$value.y~rm$value.x)
+mod.A3[[i]]<-summary(rel.mod)
+names(mod.A3)[i]<-unique(relmerge4$B)[i]
+r2.pic<-rbind(r2.pic,c(unique(relmerge4$B)[i],summary(rel.mod)$r.squared,summary(rel.mod)$coefficients[2,4]))
+plot(rm$value.y~rm$value.x, xlab='Relative abundance of Tier 3 functions \n[Metagenomic annotation]',ylab='Relative abundance of Tier 3 functions \n[16S Functional prediction]', main=unique(relmerge4$B)[i]) 
+abline(a=0,b=1, col='red') 
+}   
+
+mod.A4<-list()
+relmerge4<-relmerge3[which(relmerge3$A==unique(relmerge3$A)[4]),]
+par(mfrow=c(4,3),mar=c(5,5,5,2))
+for (i in 1:length(unique(relmerge4$B))){
+rm<-relmerge4[which(relmerge4$B==unique(relmerge4$B)[i]),]
+rel.mod<-lm(rm$value.y~rm$value.x)
+mod.A4[[i]]<-summary(rel.mod)
+names(mod.A4)[i]<-unique(relmerge4$B)[i]
+r2.pic<-rbind(r2.pic,c(unique(relmerge4$B)[i],summary(rel.mod)$r.squared,summary(rel.mod)$coefficients[2,4]))
+plot(rm$value.y~rm$value.x, xlab='Relative abundance of Tier 3 functions \n[Metagenomic annotation]',ylab='Relative abundance of Tier 3 functions \n[16S Functional prediction]', main=unique(relmerge4$B)[i]) 
+abline(a=0,b=1, col='red') 
+} 
+    
+mod.A5<-list()
+relmerge4<-relmerge3[which(relmerge3$A==unique(relmerge3$A)[5]),]
+par(mfrow=c(4,3),mar=c(5,5,5,2))
+for (i in 1:length(unique(relmerge4$B))){
+rm<-relmerge4[which(relmerge4$B==unique(relmerge4$B)[i]),]
+rel.mod<-lm(rm$value.y~rm$value.x)
+mod.A5[[i]]<-summary(rel.mod)
+names(mod.A5)[i]<-unique(relmerge4$B)[i]
+r2.pic<-rbind(r2.pic,c(unique(relmerge4$B)[i],summary(rel.mod)$r.squared,summary(rel.mod)$coefficients[2,4]))
+plot(rm$value.y~rm$value.x, xlab='Relative abundance of Tier 3 functions \n[Metagenomic annotation]',ylab='Relative abundance of Tier 3 functions \n[16S Functional prediction]', main=unique(relmerge4$B)[i]) 
+abline(a=0,b=1, col='red') 
+} 
+    # Points under the line indicate functions more abundant in metagenom. and points     above line indicate functions more abundant in 16S
+
+# Extract the R2
+
+
+```
+
+Note that variance in relative abundances for a given function across samples is larger for metagenomics than Tax4Fun data (data not shown).
+
+##### Performing Procrustes comparison of site representation in Meta and Tax4
+```{r, echo=FALSE, warning=FALSE, fig.width=12}
+# Perform ordinations on categories (65_S10 is an outlier)
+meta.pcoa<-pcoa(vegdist(sqrt(meta.rel[-which(rownames(meta.rel)%in%c('65_S10')),]), method='bray'), rn=row.names(meta.rel[-which(rownames(meta.rel)%in%c('65_S10')),]))
+tax4.pcoa<-pcoa(vegdist(sqrt(tax4.rel[-which(rownames(tax4.rel)%in%c('65_S10')),]), method='bray'), rn=row.names(tax4.rel[-which(rownames(tax4.rel)%in%c('65_S10')),]))
+tax4.catC.pcoa<-pcoa(vegdist(sqrt(tax4.catC[-which(rownames(tax4.catC)%in%c('65_S10')),]), method='bray'), rn=row.names(tax4.catC[-which(rownames(tax4.catC)%in%c('65_S10')),]))
+meta.catC.pcoa<-pcoa(vegdist(sqrt(meta.catC[-which(rownames(meta.catC)%in%c('65_S10')),]), method='bray'), rn=row.names(meta.catC[-which(rownames(meta.catC)%in%c('65_S10')),]))
+tax4.catB.pcoa<-pcoa(vegdist(tax4.catB[-which(rownames(tax4.catB)%in%c('65_S10')),], method='bray'), rn=row.names(tax4.catB[-which(rownames(tax4.catB)%in%c('65_S10')),]))
+meta.catB.pcoa<-pcoa(vegdist(meta.catB[-which(rownames(meta.catB)%in%c('65_S10')),], method='bray'), rn=row.names(meta.catB[-which(rownames(meta.catB)%in%c('65_S10')),]))
+# Performing Procrustes on all datasets
+par(mfrow=c(1,1))
+funtest<-protest(X=tax4.pcoa$vectors, Y=meta.pcoa$vectors, scores = "sites", permutations = 999)
+m12<-round(funtest$ss, digits=2)
+corr<-round(funtest$t0, digits=2)
+funpro<-procrustes(X=tax4.pcoa$vectors, Y=meta.pcoa$vectors, symmetric=T) # Symmetry between datasets (they are equivalent types of data, describing microbial communities)
+plot(funpro, kind=1, main='Kegg') # Sites plot
+text(funpro, labels=rownames(tax4.pcoa$vectors))
+paste('m12 =', round(m12, digits=2), '; Corr. coef =', round(corr, digits=2), sep=' ')
+funtest<-protest(X=tax4.catC.pcoa$vectors, Y=meta.catC.pcoa$vectors, scores = "sites", permutations = 999)
+m12<-funtest$ss
+corr<-funtest$t0
+funpro<-procrustes(X=tax4.catC.pcoa$vectors, Y=meta.catC.pcoa$vectors, symmetric=T) # Symmetry between datasets (they are equivalent types of data, describing microbial communities)
+plot(funpro, kind=1, main = 'cat C') # Sites plot
+text(funpro, labels=rownames(tax4.catC.pcoa$vectors))
+paste('m12 =', round(m12, digits=2), '; Corr. coef =', round(corr, digits=2), sep=' ')
+funtest<-protest(X=tax4.catB.pcoa$vectors, Y=meta.catB.pcoa$vectors, scores = "sites", permutations = 999)
+m12<-funtest$ss
+corr<-funtest$t0
+funpro<-procrustes(X=tax4.catB.pcoa$vectors, Y=meta.catB.pcoa$vectors, symmetric=T) # Symmetry between datasets (they are equivalent types of data, describing microbial communities)
+plot(funpro, kind=1, main = 'cat B') # Sites plot
+text(funpro, labels=rownames(tax4.catB.pcoa$vectors))
+paste('m12 =', round(m12, digits=2), '; Corr. coef =', round(corr, digits=2), sep=' ')
+```
+
+Among levels within a same treatment, correlations are high. But correlations between treatments decreases with level of abstraction.
+
+#### Canonical analysis of principal coordinates
+
+Determining which functions are most important for differentiating between Meta and Tax4 outputs
+
+```{r}
+# Merge datasets for canonical analyses
+# Datasets: tax4.rel, meta.rel (relative abundances per site) (both datasets are ordered in the same way)
+tax4.aa<-sqrt(tax4.catC)
+rownames(tax4.aa)<-paste('A',seq(1,24,1),sep="")
+meta.bb<-sqrt(meta.catC)
+rownames(meta.bb)<-paste('B',seq(1,24,1),sep="")
+# Merged datasets
+AA<-melt(as.matrix(tax4.aa), id.vars='row.names')
+BB<-melt(as.matrix(meta.bb), id.vars='row.names')
+AB<-rbind(AA,BB)
+AB.mat<-acast(Var1~Var2, data=AB, fill=0)
+# Constraints
+meth<-c(rep('Tax4',24),rep('Meta',24))
+```
+
+##### Performing a constrained PCoA
+```{r}
+# Canonical analysis
+## Avoid negative eigenvalues by taking square roots of dissimilarities
+# Capscale - PCoA with constraint
+taxmeta.cap<-capscale(AB.mat[-c(10,34),]~meth[-c(10,34)], dist = "bray", sqrt.dist= TRUE) # Remove 65_S10 [-c(10,34),] 
+
+# Add text for the 20 most correlated functions for example (10 each side)
+fct<-c(sort(taxmeta.cap$CCA$v[,1])[1:10],sort(taxmeta.cap$CCA$v[,1])[(length(taxmeta.cap$CCA$v[,1])-9):length(taxmeta.cap$CCA$v[,1])])
+fct<-as.data.frame(fct)
+fct.m<-merge(fct,bb,by.x=c('row.names'),by.y=c('C'), all.x=T)
+fct.m<-fct.m[order(fct.m$A,fct.m$B),]
+fct.m<-fct.m[,c(3,4,1,2)]
+
+plot(taxmeta.cap, display=c('wa','sp'))
+#text(x=fct, y=0, labels=names(fct), cex=0.2)
+```
+
+```{r, echo=FALSE}
+print('Proportion variance explained, first 6 axes')
+head(eigenvals(taxmeta.cap)/sum(eigenvals(taxmeta.cap)))
+```
+
+Functions most associated with CAP axis (first six functions)
+```{r}
+sort(taxmeta.cap$CCA$v[,1])[1:10]
+sort(taxmeta.cap$CCA$v[,1])[1:10]
+```
+
+#### Taxonomic analysis
+
+##### Generating data sets for taxonomic analysis
+
+**TODO - can clean up and/or delete one of the tax or meta.tax objects since they are identical**
+
+##### Partitioning diversity
+```{r}
+taxdiv<-NULL
+for (i in 1:length(tax)){
+  fc<-MetaCommunity(t(tax[[i]]), Weights=rep(1, ncol(t(tax[[i]]))))
+  fd<-DivPart(MC=fc)
+  taxdiv<-rbind(taxdiv,rbind(fd))
+}
+taxdiv[,1]<-lev
+taxdiv
+```
+
+#### Host filtering of microbial taxa
+
+```{r}
+# The principle is to compare the occurrence of traits in observed communities
+# to those obtained from randomizations of community trait matrices, generated by picking traits at random
+# and keeping site totals and trait totals constant.
+# Trait matrix (pick taxonomic table of interest, from i=1 for phylum to i=6 for species)
+m<-round((tax[[1]])*10^5) # Can also select specific taxa
+# Permutations of the trait matrix to generate "random" communities
+nperm<-999
+x4<-permatfull(m, fixedmar = "both", times=nperm)
+ft.left<-matrix(NA, nrow(m), ncol(m))      # Generate a matrix that will hold the proportions of randomized trait values lower than the observed for each site
+ft.right<-matrix(NA, nrow(m), ncol(m))     # Generate a matrix that will hold the proportions of randomized trait values higher than the observed for each site
+colnames(ft.left)<-colnames(ft.right)<-colnames(m)
+rownames(ft.left)<-rownames(ft.right)<-rownames(m)
+for (k in 1:nrow(m)){                  # For each site
+  
+  gt<-matrix(NA, nperm, ncol(m))         # Generate a matrix that will hold the "i" random values generated for every "k" trait
+  
+  for (i in 1:nperm){
+    for (j in 1:ncol(m)){
+      gt[i,j]<-x4[[3]][[i]][[k,j]]     # Assign the value that corresponds to the right site x trait x permutation combination in object x4
+    }
+  }
+  
+  # Compare the observed value to the null distribution (each column of gt)
+  
+  for (j in 1:ncol(m)){
+    ft.left[k,j]<-length(which(gt[,j]<=m[k,j]))/1000     # Compare observed value to vectors of randomized value for each trait x site combination
+    ft.right[k,j]<-length(which(gt[,j]>=m[k,j]))/1000
+  }
+  
+}
+#hist(ft.left[,4], breaks=20)
+hist(ft.left, breaks=20)
+
+# ft.left.spp<-ft.left
+# ft.left.gen<-ft.left
+# ft.left.fam<-ft.left
+# ft.left.ord<-ft.left
+# ft.left.cla<-ft.left
+# ft.left.phy<-ft.left
+avg.ft<-NULL
+gg<-list(ft.left.phy,ft.left.cla,ft.left.ord,ft.left.fam,ft.left.gen,ft.left.spp)
+for (i in 1:length(gg)){
+  sub.ft<-as.data.frame(gg[i])
+  hi<-length(sub.ft[sub.ft>0.95])
+  lo<-length(sub.ft[sub.ft<0.05])
+  tot<-nrow(sub.ft)*ncol(sub.ft)
+  avg.ft<-rbind(avg.ft,c(hi,lo,tot,i))
+}
+colnames(avg.ft)<-c('num.high','num.low','num.tot','taxo.lvl')
+
+# Proportions
+avg.ft<-as.data.frame(avg.ft)
+avg.ft$prop.high<-avg.ft$num.high/avg.ft$num.tot
+avg.ft$prop.low<-avg.ft$num.low/avg.ft$num.tot
+avg.ft<-avg.ft[,c(4,1,5,2,6,3)]
+avg.ft$taxo.lvl<-c('phy','cla','ord','fam','gen','spp')
+avg.ft[,c(3,5)]<-apply(avg.ft[,c(3,5)],2,FUN=function(x) round(x*100))
+
+write.csv(avg.ft,'/home/genevieve/avgft.csv')
+```
